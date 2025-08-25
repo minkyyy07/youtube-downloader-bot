@@ -1,177 +1,522 @@
 package school.sorokin.javabot;
 
-import lombok.SneakyThrows;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import org.telegram.telegrambots.client.okhttp.OkHttpTelegramClient;
 import org.telegram.telegrambots.longpolling.util.LongPollingSingleThreadUpdateConsumer;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
-import org.telegram.telegrambots.meta.api.methods.send.SendPhoto;
-import org.telegram.telegrambots.meta.api.objects.CallbackQuery;
-import org.telegram.telegrambots.meta.api.objects.InputFile;
+import org.telegram.telegrambots.meta.api.methods.send.SendDocument;
 import org.telegram.telegrambots.meta.api.objects.Update;
-import org.telegram.telegrambots.meta.api.objects.User;
+import org.telegram.telegrambots.meta.api.objects.InputFile;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.InlineKeyboardMarkup;
-import org.telegram.telegrambots.meta.api.objects.replykeyboard.ReplyKeyboardMarkup;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.InlineKeyboardButton;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.InlineKeyboardRow;
-import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.KeyboardRow;
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
-import org.telegram.telegrambots.meta.generics.TelegramClient;
 
-import java.io.IOException;
-import java.net.MalformedURLException;
-import java.net.URL;
-import java.util.ArrayList;
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.InputStreamReader;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.attribute.PosixFilePermissions;
+import java.time.Duration;
+import java.util.HashSet;
 import java.util.List;
-import java.util.concurrent.ThreadLocalRandom;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 @Component
 public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
 
-    private final TelegramClient telegramClient;
+    private OkHttpTelegramClient telegramClient;
+    private final String ytDlpPath;
+    private String ffmpegPath; // кэшированный путь к ffmpeg или null
 
-    public UpdateConsumer() {
-        this.telegramClient = new OkHttpTelegramClient(
-                "8052673046:AAEB_09sfW3Y25OfMh8dbAggLkgfIo0gOt8"
-        );
+    // Кэш соответствий короткий ID -> оригинальный URL
+    private static final Map<String, String> URL_CACHE = new ConcurrentHashMap<>();
+    private static final Pattern AUDIO_CALLBACK_PATTERN = Pattern.compile("a_(mp3|orig)_([a-zA-Z0-9]{12})");
+
+    private volatile boolean ffmpegReported = false;
+
+    public UpdateConsumer(@Value("${telegram.bot.token}") String botToken,
+                          @Value("${downloader.ytdlp.path:yt-dlp}") String ytDlpPath,
+                          @Value("${ffmpeg.path:}") String ffmpegConfigured) {
+        this.telegramClient = new OkHttpTelegramClient(botToken);
+        this.ytDlpPath = ytDlpPath;
+        this.ffmpegPath = resolveFfmpegPath(ffmpegConfigured);
     }
 
-    @SneakyThrows
     @Override
     public void consume(Update update) {
-        if (update.hasMessage()) {
-            String messageText = update.getMessage().getText();
-            Long chatId = update.getMessage().getChatId();
-
-            if (messageText.equals("/start")) {
-                sendMainMenu(chatId);
-            } else if (messageText.equals("/keyboard")) {
-                sendReplyKeyboard(chatId);
-            } else if (messageText.equals("Привет")) {
-                sendMyName(chatId, update.getMessage().getFrom());
-            } else if (messageText.equals("Картинка")) {
-                sendImage(chatId);
-            }else {
-                sendMessage(chatId, "Я вас не понимаю");
-            }
+        if (update.hasMessage() && update.getMessage().hasText()) {
+            handleTextMessage(update);
         } else if (update.hasCallbackQuery()) {
-            handleCallbackQuery(update.getCallbackQuery());
+            handleCallbackQuery(update);
         }
     }
 
-    @SneakyThrows
-    private void sendReplyKeyboard(Long chatId) {
+    private void handleTextMessage(Update update) {
+        String messageText = update.getMessage().getText();
+        Long chatId = update.getMessage().getChatId();
+        try {
+            switch (messageText) {
+                case "/start" -> sendWelcomeMessage(chatId);
+                case "/help" -> sendHelpMessage(chatId);
+                case "/debug" -> sendDebug(chatId);
+                default -> {
+                    if (isValidUrl(messageText)) {
+                        showDownloadOptions(chatId, messageText);
+                    } else {
+                        sendMessage(chatId, "❌ Неверная ссылка. Поддерживаются YouTube и TikTok ссылки.");
+                    }
+                }
+            }
+        } catch (Exception e) {
+            sendMessage(chatId, "❌ Произошла ошибка при обработке сообщения.");
+            e.printStackTrace();
+        }
+    }
+
+    private void sendDebug(Long chatId) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("yt-dlp path: ").append(ytDlpPath).append('\n');
+        sb.append("yt-dlp available: ").append(isYtDlpAvailable()).append('\n');
+        sb.append("ffmpeg configured path: ").append(ffmpegPath == null ? "<null>" : ffmpegPath).append('\n');
+        sb.append("ffmpeg available: ").append(isFfmpegAvailable()).append('\n');
+        sendMessage(chatId, sb.toString());
+    }
+
+    private void handleCallbackQuery(Update update) {
+        String callbackData = update.getCallbackQuery().getData();
+        Long chatId = update.getCallbackQuery().getMessage().getChatId();
+
+        if (callbackData.startsWith("v_")) {
+            String url = extractUrlFromCallback(callbackData); // v_<id>
+            if (url == null) {
+                sendMessage(chatId, "❌ Ссылка устарела. Отправьте её снова.");
+                return;
+            }
+            downloadVideo(chatId, url);
+            return;
+        }
+        Matcher m = AUDIO_CALLBACK_PATTERN.matcher(callbackData);
+        if (m.matches()) {
+            String fmt = m.group(1); // mp3 | orig
+            String id = m.group(2);
+            String url = URL_CACHE.get(id);
+            if (url == null) {
+                sendMessage(chatId, "❌ Ссылка устарела. Отправьте её снова.");
+                return;
+            }
+            downloadAudio(chatId, url, fmt);
+            return;
+        }
+        sendMessage(chatId, "❌ Неизвестное действие.");
+    }
+
+    private void sendWelcomeMessage(Long chatId) {
+        String welcomeText = """
+                🎬 *Добро пожаловать в YouTube & TikTok Downloader!*
+                
+                📹 Отправьте мне ссылку на видео или аудио из:
+                • YouTube
+                • TikTok
+                
+                И я помогу вам скачать видео или извлечь аудио!
+                
+                Используйте /help для получения дополнительной информации.
+                """;
+
         SendMessage message = SendMessage.builder()
                 .chatId(chatId.toString())
-                .text("Это пример обычной клавиатуры:")
+                .text(welcomeText)
+                .parseMode("Markdown")
                 .build();
 
-        List<KeyboardRow> keyboardRows = List.of(
-                new KeyboardRow("Привет", "Картинка")
-        );
-
-        ReplyKeyboardMarkup markup = new ReplyKeyboardMarkup(keyboardRows);
-        message.setReplyMarkup(markup);
-
-        telegramClient.execute(message);
+        executeMessage(message);
     }
 
-    private void handleCallbackQuery(CallbackQuery callbackQuery) {
-        var data = callbackQuery.getData();
-        var chatId = callbackQuery.getFrom().getId();
-        var user = callbackQuery.getFrom();
-        switch (data) {
-            case "my_name" -> sendMyName(chatId, user);
-            case "random" -> sendRandom(chatId);
-            case "long_process" -> sendImage(chatId);
-            default -> sendMessage(chatId, "Неизвестная команда");
+    private void sendHelpMessage(Long chatId) {
+        String helpText = """
+                📖 *Помощь по использованию бота:*
+                
+                1️⃣ Скопируйте ссылку на видео
+                2️⃣ Отправьте её боту
+                3️⃣ Выберите формат скачивания:
+                   • 📹 Видео - полное видео
+                   • 🎵 Аудио - только звуковая дорожка
+                
+                ⚡ *Поддерживаемые платформы:*
+                • YouTube (youtube.com)
+                • TikTok (tiktok.com)
+                
+                ⚠️ *Ограничения(Временно):*
+                • Максимальная длительность: 10 минут
+                • Максимальный размер файла: 50 МБ
+                """;
+
+        SendMessage message = SendMessage.builder()
+                .chatId(chatId.toString())
+                .text(helpText)
+                .parseMode("Markdown")
+                .build();
+
+        executeMessage(message);
+    }
+
+    private void showDownloadOptions(Long chatId, String url) {
+        String id = UUID.randomUUID().toString().replace("-", "").substring(0, 12);
+        URL_CACHE.put(id, url);
+
+        InlineKeyboardButton videoBtn = InlineKeyboardButton.builder()
+                .text("📹 Видео")
+                .callbackData("v_" + id)
+                .build();
+        InlineKeyboardButton audioMp3Btn = InlineKeyboardButton.builder()
+                .text("🎵 MP3 128k")
+                .callbackData("a_mp3_" + id)
+                .build();
+        InlineKeyboardButton audioOrigBtn = InlineKeyboardButton.builder()
+                .text("🎵 Оригинал")
+                .callbackData("a_orig_" + id)
+                .build();
+
+        InlineKeyboardMarkup keyboard = InlineKeyboardMarkup.builder()
+                .keyboardRow(new InlineKeyboardRow(videoBtn))
+                .keyboardRow(new InlineKeyboardRow(audioMp3Btn, audioOrigBtn))
+                .build();
+
+        SendMessage message = SendMessage.builder()
+                .chatId(chatId.toString())
+                .text("🔗 Ссылка получена! Выберите формат для скачивания:")
+                .replyMarkup(keyboard)
+                .build();
+
+        executeMessage(message);
+    }
+
+    private void downloadVideo(Long chatId, String url) {
+        sendMessage(chatId, "⏬ Начинаю скачивание видео...");
+        CompletableFuture.runAsync(() -> {
+            try {
+                String fileName = downloadContent(chatId, url, "video");
+                if (fileName != null) {
+                    sendFile(chatId, fileName, "📹 Ваше видео готово!");
+                    deleteFile(fileName);
+                } else {
+                    sendMessage(chatId, "❌ Не удалось скачать видео.");
+                }
+            } catch (Exception e) {
+                sendMessage(chatId, "�� Ошибка при скачивании видео.");
+                e.printStackTrace();
+            }
+        });
+    }
+
+    private void downloadAudio(Long chatId, String url, String fmt) {
+        boolean wantMp3 = "mp3".equals(fmt);
+        sendMessage(chatId, wantMp3 ? "⏬ Аудио (MP3) — начинаю..." : "⏬ Аудио (оригинал) — начинаю...");
+        CompletableFuture.runAsync(() -> {
+            try {
+                String downloaded = downloadBestAudio(chatId, url);
+                if (downloaded == null) return; // сообщение уже отправлено
+                String toSend = downloaded;
+                if (wantMp3) {
+                    toSend = ensureMp3(chatId, downloaded);
+                }
+                sendFile(chatId, toSend, wantMp3 ? "🎵 MP3 готово!" : "🎵 Аудио готово!");
+                if (!toSend.equals(downloaded)) {
+                    deleteFile(downloaded);
+                }
+                deleteFile(toSend);
+            } catch (Exception e) {
+                sendMessage(chatId, "❌ Ошибка при скачивании аудио.");
+                e.printStackTrace();
+            }
+        });
+    }
+
+    // --- ffmpeg detection helpers ---
+    private String resolveFfmpegPath(String configured) {
+        if (configured != null && !configured.isBlank()) {
+            if (fileExecutable(configured) || versionOk(configured)) return configured;
+        }
+        String env = System.getenv("FFMPEG_PATH");
+        if (env != null && !env.isBlank()) {
+            if (fileExecutable(env) || versionOk(env)) return env;
+        }
+        // common locations
+        List<String> candidates = List.of(
+                "ffmpeg",
+                "/opt/homebrew/bin/ffmpeg",
+                "/usr/local/bin/ffmpeg",
+                "/usr/bin/ffmpeg"
+        );
+        for (String c : candidates) {
+            if (fileExecutable(c) || versionOk(c)) return c;
+        }
+        return null;
+    }
+
+    private boolean fileExecutable(String pathStr) {
+        try {
+            Path p = Path.of(pathStr);
+            return java.nio.file.Files.exists(p) && java.nio.file.Files.isExecutable(p);
+        } catch (Exception e) {
+            return false;
         }
     }
 
-    @SneakyThrows
-    private void sendMessage(
-            Long chatId,
-            String messageText
-    ) {
-        SendMessage message = SendMessage.builder()
-                .text(messageText)
-                .chatId(chatId)
-                .build();
-
-        telegramClient.execute(message);
+    private boolean versionOk(String cmd) {
+        try {
+            Process p = new ProcessBuilder(cmd, "-version").start();
+            boolean ok = p.waitFor(4, java.util.concurrent.TimeUnit.SECONDS) && p.exitValue() == 0;
+            if (!ok) p.destroyForcibly();
+            return ok;
+        } catch (Exception e) {
+            return false;
+        }
     }
 
-    private void sendImage(Long chatId) {
-        sendMessage(chatId, "Запустили загрузку картинки");
-        new Thread(() -> {
-            var imageUrl = "https://picsum.photos/200";
-            try {
-                URL url = new URL(imageUrl);
-                var inputStream = url.openStream();
+    private boolean isFfmpegAvailable() {
+        if (ffmpegPath != null) return true;
+        ffmpegPath = resolveFfmpegPath(null);
+        if (ffmpegPath != null && !ffmpegReported) {
+            ffmpegReported = true; // можно при первом обнаружении вывести отладку; отключено чтобы не шуметь
+        }
+        return ffmpegPath != null;
+    }
 
-                SendPhoto sendPhoto = SendPhoto.builder()
-                        .chatId(chatId)
-                        .photo(new InputFile(inputStream, "random.jpg"))
-                        .caption("Ваша случайная картинка:")
-                        .build();
-
-                telegramClient.execute(sendPhoto);
-
-            } catch (TelegramApiException | IOException e) {
-                throw new RuntimeException(e);
+    private String ensureMp3(Long chatId, String fileName) {
+        if (fileName.endsWith(".mp3")) return fileName;
+        if (!isFfmpegAvailable()) {
+            sendMessage(chatId, "⚠️ ffmpeg недоступен, отправляю исходный формат.");
+            return fileName;
+        }
+        try {
+            String target = fileName.replaceFirst("\\.[^.]+$", "") + "_conv.mp3";
+            ProcessBuilder pb = new ProcessBuilder(
+                    ffmpegPath, "-y", "-i", fileName, "-vn", "-ac", "2", "-ar", "44100", "-b:a", "128k", target
+            );
+            pb.redirectErrorStream(true);
+            Process p = pb.start();
+            try (BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()))) { while (br.readLine() != null) {} }
+            p.waitFor();
+            if (p.exitValue() == 0 && Files.exists(Paths.get(target))) {
+                return target;
+            } else {
+                sendMessage(chatId, "⚠️ Не удалось конвертировать в mp3 (ffmpeg ошибка). Отправляю исходный файл.");
+                return fileName;
             }
-        }).start();
+        } catch (Exception e) {
+            sendMessage(chatId, "⚠️ Ошибка конвертации в mp3, отправляю исходный файл.");
+            return fileName;
+        }
     }
 
-    private void sendRandom(Long chatId) {
-        var randomInt = ThreadLocalRandom.current().nextInt();
-        sendMessage(chatId, "Ваше рандомное число: " + randomInt);
+    private String downloadContent(Long chatId, String url, String type) {
+        try {
+            if (!isYtDlpAvailable()) {
+                sendMessage(chatId, "⚠️ yt-dlp не установлен или недоступен.");
+                return null;
+            }
+            boolean needMp3 = "audio".equals(type);
+            boolean ffmpegAvailable = !needMp3 || isFfmpegAvailable();
+            if (needMp3 && !ffmpegAvailable) {
+                sendMessage(chatId, "⚠️ ffmpeg не найден — будет загружен исходный аудио-файл без конвертации.");
+            }
+
+            String baseName = "download_" + System.currentTimeMillis();
+            String targetFile = baseName + ("video".equals(type) ? ".mp4" : ".mp3");
+
+            Set<String> before = snapshotFiles();
+            ProcessBuilder pb = new ProcessBuilder(buildCommandEnhanced(url, type, targetFile, ffmpegAvailable));
+            pb.redirectErrorStream(true);
+            Process process = pb.start();
+            StringBuilder log = new StringBuilder();
+            try (BufferedReader br = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                String line;
+                while ((line = br.readLine()) != null) {
+                    log.append(line).append('\n');
+                }
+            }
+            boolean finished = process.waitFor(Duration.ofMinutes(7).toMillis(), java.util.concurrent.TimeUnit.MILLISECONDS);
+            if (!finished) {
+                process.destroyForcibly();
+                sendMessage(chatId, "⏱ Превышено время ожидания.");
+                return null;
+            }
+            int exit = process.exitValue();
+            if (exit != 0) {
+                String logStr = log.toString();
+                if (logStr.toLowerCase().contains("ffmpeg")) {
+                    sendMessage(chatId, "⚠️ Требуется ffmpeg для конвертации в mp3: установите ffmpeg.");
+                } else {
+                    sendMessage(chatId, "❌ Ошибка скачивания (код " + exit + ").");
+                }
+                return null;
+            }
+            // Прямой файл (для видео или mp3 после конвертации)
+            if (Files.exists(Paths.get(targetFile))) {
+                // если аудио без ffmpeg: имя будет baseName.<origExt>; targetFile (mp3) не существует — обработка ниже
+            }
+            Set<String> after = snapshotFiles();
+            after.removeAll(before);
+            String chosen = after.stream().filter(f -> f.startsWith(baseName + ".")).findFirst().orElse(null);
+            if (chosen != null) {
+                if (needMp3 && ffmpegAvailable && !chosen.endsWith(".mp3")) {
+                    sendMessage(chatId, "⚠️ Получен файл без конвертации в mp3.");
+                }
+                return chosen;
+            }
+            sendMessage(chatId, "❌ Файл не найден после скачивания.");
+        } catch (Exception e) {
+            e.printStackTrace();
+            sendMessage(chatId, "❌ Внутренняя ошибка при скачивании.");
+        }
+        return null;
     }
 
-    private void sendMyName(
-            Long chatId,
-            User user
-    ) {
-        var text = "Привет!\n\nВас зовут: %s\nВаш ник: @%s"
-                .formatted(
-                        user.getFirstName() + " " + user.getLastName(),
-                        user.getUserName()
-                );
-        sendMessage(chatId, text);
+    private boolean isYtDlpAvailable() {
+        try {
+            Process p = new ProcessBuilder(ytDlpPath, "--version").start();
+            boolean finished = p.waitFor(3, java.util.concurrent.TimeUnit.SECONDS);
+            if (!finished) {
+                p.destroyForcibly();
+                return false;
+            }
+            return p.exitValue() == 0;
+        } catch (Exception e) {
+            return false;
+        }
     }
 
-    @SneakyThrows
-    private void sendMainMenu(Long chatId) {
+    private Set<String> snapshotFiles() {
+        try (var stream = Files.list(Paths.get("."))) {
+            Set<String> set = new HashSet<>();
+            stream.filter(p -> !Files.isDirectory(p)).forEach(p -> set.add(p.getFileName().toString()));
+            return set;
+        } catch (Exception e) {
+            return new HashSet<>();
+        }
+    }
+
+    private java.util.List<String> buildCommandEnhanced(String url, String type, String targetFile, boolean ffmpegAvailable) {
+        java.util.List<String> cmd = new java.util.ArrayList<>();
+        cmd.add(ytDlpPath);
+        if ("video".equals(type)) {
+            cmd.addAll(java.util.List.of("-f", "best[height<=720]", "-o", targetFile, url));
+        } else { // audio
+            // targetFile = baseName + ".mp3" (если ffmpegAvailable) иначе baseName + ".mp3" но потом будет другой ext
+            String base = targetFile.endsWith(".mp3") ? targetFile.substring(0, targetFile.length() - 4) : targetFile;
+            if (ffmpegAvailable) {
+                cmd.addAll(java.util.List.of("-f", "bestaudio", "-x", "--audio-format", "mp3", "-o", base + ".%(ext)s", url));
+            } else {
+                // без ffmpeg: просто bestaudio в формате исходника, но имя всё равно baseName.ext чтобы обнаружить
+                cmd.addAll(java.util.List.of("-f", "bestaudio", "-o", base + ".%(ext)s", url));
+            }
+        }
+        return cmd;
+    }
+
+    private void sendFile(Long chatId, String fileName, String caption) {
+        try {
+            File file = new File(fileName);
+            if (file.length() > 50 * 1024 * 1024) { // 50MB limit
+                sendMessage(chatId, "❌ Файл слишком большой для отправки (лимит 50МБ).");
+                return;
+            }
+
+            SendDocument document = SendDocument.builder()
+                    .chatId(chatId.toString())
+                    .document(new InputFile(file))
+                    .caption(caption)
+                    .build();
+
+            telegramClient.execute(document);
+        } catch (TelegramApiException e) {
+            sendMessage(chatId, "❌ Ошибка при отправке файла.");
+            e.printStackTrace();
+        }
+    }
+
+    private void sendMessage(Long chatId, String text) {
         SendMessage message = SendMessage.builder()
-                .text("Добро пожаловать! Выберите действие:")
-                .chatId(chatId)
+                .chatId(chatId.toString())
+                .text(text)
                 .build();
 
-        var button1 = InlineKeyboardButton.builder()
-                .text("Как меня зовут?")
-                .callbackData("my_name")
-                .build();
+        executeMessage(message);
+    }
 
-        var button2 = InlineKeyboardButton.builder()
-                .text("Случайное число")
-                .callbackData("random")
-                .build();
+    private void executeMessage(SendMessage message) {
+        try {
+            telegramClient.execute(message);
+        } catch (TelegramApiException e) {
+            e.printStackTrace();
+        }
+    }
 
-        var button3 = InlineKeyboardButton.builder()
-                .text("Долгий процесс")
-                .callbackData("long_process")
-                .build();
+    private boolean isValidUrl(String url) {
+        return url.contains("youtube.com") || url.contains("youtu.be") || url.contains("tiktok.com");
+    }
 
-        List<InlineKeyboardRow> keyboardRows = List.of(
-                new InlineKeyboardRow(button1),
-                new InlineKeyboardRow(button2),
-                new InlineKeyboardRow(button3)
-        );
+    private String extractUrlFromCallback(String callbackData) {
+        int idx = callbackData.indexOf('_');
+        if (idx < 0 || idx == callbackData.length() - 1) return null;
+        String id = callbackData.substring(idx + 1);
+        return URL_CACHE.get(id);
+    }
 
-        InlineKeyboardMarkup markup = new InlineKeyboardMarkup(keyboardRows);
+    private void deleteFile(String fileName) {
+        try {
+            Files.deleteIfExists(Paths.get(fileName));
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
 
-        message.setReplyMarkup(markup);
-
-        telegramClient.execute(message);
+    private String downloadBestAudio(Long chatId, String url) {
+        try {
+            if (!isYtDlpAvailable()) {
+                sendMessage(chatId, "⚠️ yt-dlp недоступен.");
+                return null;
+            }
+            String baseName = "download_" + System.currentTimeMillis();
+            String pattern = baseName + ".%(ext)s";
+            Set<String> before = snapshotFiles();
+            ProcessBuilder pb = new ProcessBuilder(ytDlpPath, "-f", "bestaudio", "-o", pattern, url);
+            pb.redirectErrorStream(true);
+            Process p = pb.start();
+            try (BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
+                while (br.readLine() != null) {}
+            }
+            boolean finished = p.waitFor(6, java.util.concurrent.TimeUnit.MINUTES);
+            if (!finished) {
+                p.destroyForcibly();
+                sendMessage(chatId, "⏱ Таймаут скачивания аудио.");
+                return null;
+            }
+            if (p.exitValue() != 0) {
+                sendMessage(chatId, "❌ Ошибка скачивания аудио (код " + p.exitValue() + ").");
+                return null;
+            }
+            Set<String> after = snapshotFiles();
+            after.removeAll(before);
+            return after.stream().filter(f -> f.startsWith(baseName + ".")).findFirst().orElseGet(() -> {
+                sendMessage(chatId, "❌ Аудио файл не найден.");
+                return null;
+            });
+        } catch (Exception e) {
+            e.printStackTrace();
+            sendMessage(chatId, "❌ Внутренняя ошибка при скачивании аудио.");
+            return null;
+        }
     }
 }
