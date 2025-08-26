@@ -19,7 +19,6 @@ import java.io.InputStreamReader;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.nio.file.attribute.PosixFilePermissions;
 import java.time.Duration;
 import java.util.HashSet;
 import java.util.List;
@@ -37,19 +36,23 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
     private OkHttpTelegramClient telegramClient;
     private final String ytDlpPath;
     private String ffmpegPath; // кэшированный путь к ffmpeg или null
+    private final HostedFileService hostedFileService; // добавлено
 
     // Кэш соответствий короткий ID -> оригинальный URL
     private static final Map<String, String> URL_CACHE = new ConcurrentHashMap<>();
     private static final Pattern AUDIO_CALLBACK_PATTERN = Pattern.compile("a_(mp3|orig)_([a-zA-Z0-9]{12})");
+    private static final Map<Long, Boolean> LINK_PREFS = new ConcurrentHashMap<>(); // chatId -> showRawUrl
 
     private volatile boolean ffmpegReported = false;
 
     public UpdateConsumer(@Value("${telegram.bot.token}") String botToken,
                           @Value("${downloader.ytdlp.path:yt-dlp}") String ytDlpPath,
-                          @Value("${ffmpeg.path:}") String ffmpegConfigured) {
+                          @Value("${ffmpeg.path:}") String ffmpegConfigured,
+                          HostedFileService hostedFileService) { // добавлен параметр
         this.telegramClient = new OkHttpTelegramClient(botToken);
         this.ytDlpPath = ytDlpPath;
         this.ffmpegPath = resolveFfmpegPath(ffmpegConfigured);
+        this.hostedFileService = hostedFileService; // присваивание
     }
 
     @Override
@@ -69,6 +72,7 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
                 case "/start" -> sendWelcomeMessage(chatId);
                 case "/help" -> sendHelpMessage(chatId);
                 case "/debug" -> sendDebug(chatId);
+                case "/togglelink" -> toggleLinkPreference(chatId);
                 default -> {
                     if (isValidUrl(messageText)) {
                         showDownloadOptions(chatId, messageText);
@@ -174,6 +178,10 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
         String id = UUID.randomUUID().toString().replace("-", "").substring(0, 12);
         URL_CACHE.put(id, url);
 
+        InlineKeyboardButton openUrlBtn = InlineKeyboardButton.builder()
+                .text("🔗 Открыть ссылку")
+                .url(url)
+                .build();
         InlineKeyboardButton videoBtn = InlineKeyboardButton.builder()
                 .text("📹 Видео")
                 .callbackData("v_" + id)
@@ -188,13 +196,16 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
                 .build();
 
         InlineKeyboardMarkup keyboard = InlineKeyboardMarkup.builder()
+                .keyboardRow(new InlineKeyboardRow(openUrlBtn))
                 .keyboardRow(new InlineKeyboardRow(videoBtn))
                 .keyboardRow(new InlineKeyboardRow(audioMp3Btn, audioOrigBtn))
                 .build();
 
+        String body = "🔗 Ссылка получена! Выберите формат или откройте оригинал:\n" + url;
         SendMessage message = SendMessage.builder()
                 .chatId(chatId.toString())
-                .text("🔗 Ссылка получена! Выберите формат для скачивания:")
+                .text(body)
+                .disableWebPagePreview(true)
                 .replyMarkup(keyboard)
                 .build();
 
@@ -208,7 +219,10 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
                 String fileName = downloadContent(chatId, url, "video");
                 if (fileName != null) {
                     sendFile(chatId, fileName, "📹 Ваше видео готово!");
-                    deleteFile(fileName);
+                    File f = new File(fileName);
+                    if (f.exists() && f.length() <= 50L * 1024 * 1024) {
+                        deleteFile(fileName);
+                    }
                 } else {
                     sendMessage(chatId, "❌ Не удалось скачать видео.");
                 }
@@ -220,21 +234,16 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
     }
 
     private void downloadAudio(Long chatId, String url, String fmt) {
-        boolean wantMp3 = "mp3".equals(fmt);
-        sendMessage(chatId, wantMp3 ? "⏬ Аудио (MP3) — начинаю..." : "⏬ Аудио (оригинал) — начинаю...");
+        sendMessage(chatId, "⏬ Аудио — начинаю...");
         CompletableFuture.runAsync(() -> {
             try {
                 String downloaded = downloadBestAudio(chatId, url);
-                if (downloaded == null) return; // сообщение уже отправлено
-                String toSend = downloaded;
-                if (wantMp3) {
-                    toSend = ensureMp3(chatId, downloaded);
-                }
-                sendFile(chatId, toSend, wantMp3 ? "🎵 MP3 готово!" : "🎵 Аудио готово!");
-                if (!toSend.equals(downloaded)) {
+                if (downloaded == null) return;
+                sendFile(chatId, downloaded, "🎵 Аудио готово!");
+                File f = new File(downloaded);
+                if (f.exists() && f.length() <= 50L * 1024 * 1024) {
                     deleteFile(downloaded);
                 }
-                deleteFile(toSend);
             } catch (Exception e) {
                 sendMessage(chatId, "❌ Ошибка при скачивании аудио.");
                 e.printStackTrace();
@@ -428,8 +437,11 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
     private void sendFile(Long chatId, String fileName, String caption) {
         try {
             File file = new File(fileName);
-            if (file.length() > 50 * 1024 * 1024) { // 50MB limit
-                sendMessage(chatId, "❌ Файл слишком большой для отправки (лимит 50МБ).");
+            long fileSize = file.length();
+            if (fileSize > 50 * 1024 * 1024) { // 50MB limit -> выдаём локальную ссылку
+                String id = hostedFileService.register(file);
+                String url = hostedFileService.buildUrl(id);
+                sendLinkMessage(chatId, "Файл >50МБ. Нажмите кнопку для скачивания (ссылка временная):", "⬇️ Скачать", url);
                 return;
             }
 
@@ -446,20 +458,157 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
         }
     }
 
-    private void sendMessage(Long chatId, String text) {
+    private void toggleLinkPreference(Long chatId) {
+        boolean current = LINK_PREFS.getOrDefault(chatId, true);
+        boolean next = !current;
+        LINK_PREFS.put(chatId, next);
+        sendMessage(chatId, next ? "Теперь ссылка будет дублироваться текстом." : "Теперь показываю только кнопку без текстовой ссылки.");
+    }
+
+    private void sendLinkMessage(Long chatId, String text, String buttonText, String url) {
+        boolean showRaw = LINK_PREFS.getOrDefault(chatId, true);
+        InlineKeyboardButton btn = InlineKeyboardButton.builder().text(buttonText).url(url).build();
+        InlineKeyboardMarkup markup = InlineKeyboardMarkup.builder()
+                .keyboardRow(new InlineKeyboardRow(btn))
+                .build();
+        String body = showRaw ? text + "\n[" + buttonText + "](" + url + ")" : text;
         SendMessage message = SendMessage.builder()
                 .chatId(chatId.toString())
-                .text(text)
+                .text(body)
+                .parseMode("Markdown")
+                .replyMarkup(markup)
+                .disableWebPagePreview(true)
                 .build();
-
         executeMessage(message);
     }
 
-    private void executeMessage(SendMessage message) {
+    // Загрузка на 0x0.st (анонимно)
+    private String uploadTo0x0(File file) {
         try {
-            telegramClient.execute(message);
-        } catch (TelegramApiException e) {
-            e.printStackTrace();
+            ProcessBuilder pb = new ProcessBuilder("curl", "-s", "-F", "file=@" + file.getAbsolutePath(), "https://0x0.st");
+            pb.redirectErrorStream(true);
+            Process p = pb.start();
+            StringBuilder sb = new StringBuilder();
+            try (BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
+                String line; while ((line = br.readLine()) != null) sb.append(line); }
+            p.waitFor();
+            String resp = sb.toString().trim();
+            if (resp.startsWith("https://0x0.st/")) return resp;
+            return "ERROR:" + resp;
+        } catch (Exception e) {
+            return "ERROR: " + e.getMessage();
+        }
+    }
+
+    // Загрузка на catbox.moe (анонимно)
+    private String uploadToCatbox(File file) {
+        try {
+            ProcessBuilder pb = new ProcessBuilder(
+                    "curl",
+                    "-F", "reqtype=fileupload",
+                    "-F", "fileToUpload=@" + file.getAbsolutePath(),
+                    "https://catbox.moe/user/api.php"
+            );
+            pb.redirectErrorStream(true);
+            Process p = pb.start();
+            StringBuilder sb = new StringBuilder();
+            try (BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
+                String line; while ((line = br.readLine()) != null) sb.append(line).append('\n');
+            }
+            p.waitFor();
+            String resp = sb.toString().trim();
+            // Успешный ответ — прямая ссылка, иначе текст ошибки
+            if (resp.startsWith("https://")) return resp;
+            return "ERROR:" + resp;
+        } catch (Exception e) {
+            return "ERROR: " + e.getMessage();
+        }
+    }
+
+    private String uploadToFileIo(File file) {
+        try {
+            ProcessBuilder pb = new ProcessBuilder("curl", "-F", "file=@" + file.getAbsolutePath(), "https://file.io");
+            pb.redirectErrorStream(true);
+            Process p = pb.start();
+            StringBuilder sb = new StringBuilder();
+            try (BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
+                String line;
+                while ((line = br.readLine()) != null) {
+                    sb.append(line).append('\n');
+                }
+            }
+            p.waitFor();
+            String result = sb.toString().trim();
+            // file.io возвращает JSON вида: {"success":true,"link":"https://file.io/xxxxxx",...}
+            if (result.contains("https://file.io/")) {
+                int start = result.indexOf("https://file.io/");
+                int end = result.indexOf('"', start);
+                if (end > start) {
+                    return result.substring(start, end);
+                } else {
+                    return result.substring(start);
+                }
+            } else {
+                return "ERROR:" + result;
+            }
+        } catch (Exception e) {
+            return "ERROR: " + e.getMessage();
+        }
+    }
+
+    private String uploadToGoFile(File file) {
+        try {
+            ProcessBuilder pbServer = new ProcessBuilder("curl", "-s", "https://api.gofile.io/getServer");
+            pbServer.redirectErrorStream(true);
+            Process pServer = pbServer.start();
+            StringBuilder sbServer = new StringBuilder();
+            try (BufferedReader br = new BufferedReader(new InputStreamReader(pServer.getInputStream()))) {
+                String line; while ((line = br.readLine()) != null) sbServer.append(line); }
+            pServer.waitFor();
+            String serverJson = sbServer.toString();
+            // Получение сервера (замена regex на простой парсинг)
+            String server = extractJsonString(serverJson, "server");
+            if (server == null || server.isBlank()) return "ERROR: gofile getServer raw=" + serverJson;
+            String uploadUrl = "https://" + server + ".gofile.io/uploadFile";
+            ProcessBuilder pb = new ProcessBuilder("curl", "-s", "-F", "file=@" + file.getAbsolutePath(), uploadUrl);
+            pb.redirectErrorStream(true);
+            Process p = pb.start();
+            StringBuilder sb = new StringBuilder();
+            try (BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
+                String line; while ((line = br.readLine()) != null) sb.append(line); }
+            p.waitFor();
+            String result = sb.toString().trim();
+            if (result.contains("https://gofile.io/d/")) {
+                int start = result.indexOf("https://gofile.io/d/");
+                int end = result.indexOf('"', start);
+                if (end > start) return result.substring(start, end); else return result.substring(start);
+            }
+            return "ERROR:" + result;
+        } catch (Exception e) {
+            return "ERROR: " + e.getMessage();
+        }
+    }
+
+    private String uploadToPixelDrain(File file) {
+        try {
+            ProcessBuilder pb = new ProcessBuilder(
+                    "curl","-s","-X","POST","-F","file=@" + file.getAbsolutePath(),"https://pixeldrain.com/api/file"
+            );
+            pb.redirectErrorStream(true);
+            Process p = pb.start();
+            StringBuilder sb = new StringBuilder();
+            try (BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
+                String line; while ((line = br.readLine()) != null) sb.append(line).append('\n');
+            }
+            p.waitFor();
+            String json = sb.toString();
+            java.util.regex.Matcher m = java.util.regex.Pattern.compile("\"id\"\\s*:\\s*\"([^\"]+)\"").matcher(json);
+            if (m.find()) {
+                return "https://pixeldrain.com/u/" + m.group(1);
+            }
+            return "ERROR:" + json.trim();
+        } catch (Exception e) {
+            return "ERROR: " + e.getMessage();
         }
     }
 
@@ -518,5 +667,44 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
             sendMessage(chatId, "❌ Внутренняя ошибка при скачивании аудио.");
             return null;
         }
+    }
+
+    /**
+     * Отправка текстового сообщения в чат
+     */
+    private void sendMessage(Long chatId, String text) {
+        SendMessage message = SendMessage.builder()
+                .chatId(chatId.toString())
+                .text(text)
+                .build();
+        executeMessage(message);
+    }
+
+    /**
+     * Выполнение отправки сообщения через Telegram API
+     */
+    private void executeMessage(SendMessage message) {
+        try {
+            telegramClient.execute(message);
+        } catch (TelegramApiException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private boolean isOk0x0(String url) {
+        return url != null && url.startsWith("https://0x0.st/");
+    }
+
+    private String extractJsonString(String json, String key) {
+        if (json == null || key == null) return null;
+        int k = json.indexOf('"' + key + '"');
+        if (k < 0) return null;
+        int colon = json.indexOf(':', k);
+        if (colon < 0) return null;
+        int first = json.indexOf('"', colon + 1);
+        if (first < 0) return null;
+        int second = json.indexOf('"', first + 1);
+        if (second < 0) return null;
+        return json.substring(first + 1, second);
     }
 }
