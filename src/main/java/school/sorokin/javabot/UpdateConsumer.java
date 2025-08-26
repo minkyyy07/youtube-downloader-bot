@@ -467,6 +467,17 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
 
     private void sendLinkMessage(Long chatId, String text, String buttonText, String url) {
         boolean showRaw = LINK_PREFS.getOrDefault(chatId, true);
+        if (!isValidButtonUrl(url)) {
+            // Fallback: просто текстовая ссылка без inline-кнопки (иначе Telegram вернёт 400)
+            String body = showRaw ? text + "\n" + url : text;
+            SendMessage msg = SendMessage.builder()
+                    .chatId(chatId.toString())
+                    .text(body)
+                    .disableWebPagePreview(true)
+                    .build();
+            executeMessage(msg);
+            return;
+        }
         InlineKeyboardButton btn = InlineKeyboardButton.builder().text(buttonText).url(url).build();
         InlineKeyboardMarkup markup = InlineKeyboardMarkup.builder()
                 .keyboardRow(new InlineKeyboardRow(btn))
@@ -480,6 +491,18 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
                 .disableWebPagePreview(true)
                 .build();
         executeMessage(message);
+    }
+
+    private boolean isValidButtonUrl(String url) {
+        if (url == null || url.isBlank()) return false;
+        if (!(url.startsWith("https://") || url.startsWith("http://"))) return false;
+        String lower = url.toLowerCase();
+        // Блокируем localhost и приватные диапазоны, которые не доступны Telegram
+        if (lower.contains("localhost") || lower.contains("127.0.0.1")) return false;
+        if (lower.matches("https?://10\\..*")) return false;
+        if (lower.matches("https?://192\\.168\\..*")) return false;
+        if (lower.matches("https?://172\\.(1[6-9]|2[0-9]|3[0-1])\\..*")) return false;
+        return true;
     }
 
     // Загрузка на 0x0.st (анонимно)
